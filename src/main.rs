@@ -1,8 +1,8 @@
-use std::{path::{Path, PathBuf}, time::SystemTime, collections::{BTreeMap}, fs::{Permissions, create_dir_all}, env, sync::Arc};
+use std::{path::{Path, PathBuf}, time::{SystemTime, Duration}, collections::{BTreeMap}, fs::{Permissions, create_dir_all}, env, sync::Arc};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender, unbounded};
 use pathdiff::diff_paths;
-use tokio::{io::{BufReader, BufWriter}, fs::File};
+use tokio::{io::{BufReader, BufWriter}, fs::File, time::Instant};
 use walkdir::WalkDir;
 use tokio_util::compat::*;
 use clap::{Parser, Subcommand};
@@ -129,27 +129,37 @@ async fn main() -> Result<()> {
 
     let mut count = 0;
     let mut c_size: usize = 0;
+    let mut last = Instant::now() - Duration::from_millis(64);
     loop {
         if count == files {
             break;
         }
-        let msg = urx.recv().await.unwrap();
-        match msg {
-            ProgressMassage::Start { id , path, size} => {
-                v[id] = 0;
-                vv[id] = path.file_name().unwrap().to_str().unwrap().to_owned();
-                vvv[id] = size;
-            },
-            ProgressMassage::Progress { id, size } => {
-                c_size = c_size - v[id] as usize + size as usize;
-                v[id] = size;
-            },
-            ProgressMassage::Finished { id } =>  {
-                // v[id] = vvv[id] as u64;
-                count += 1;
-            },
+        let res = urx.recv().await;
+        if let Ok(msg) = res {
+            match msg {
+                ProgressMassage::Start { id , path, size} => {
+                    v[id] = 0;
+                    vv[id] = path.file_name().unwrap().to_str().unwrap().to_owned();
+                    vvv[id] = size;
+                },
+                ProgressMassage::Progress { id, size } => {
+                    c_size = c_size - v[id] as usize + size as usize;
+                    v[id] = size;
+                },
+                ProgressMassage::Finished { id } =>  {
+                    // v[id] = vvv[id] as u64;
+                    count += 1;
+                },
+            }
+            if (Instant::now() - last).as_millis() < 20 {
+                continue
+            } else {
+                draw(&window, start_y, files, count, t_size, c_size, &vv, &v, &vvv).await.unwrap();
+                last = Instant::now();
+            }
+        } else {
+            break;
         }
-        draw(&window, start_y, files, count, t_size, c_size, &vv, &v, &vvv).await.unwrap();
     }
     endwin();
     Ok(())
@@ -165,12 +175,13 @@ async fn draw(win: &Window, start_y: i32, total_files: usize, files: usize, tota
     let f_width = (total_files as f64).log10().floor() as i32 + 1;
     let width = win.get_max_x() - 28 - 2*s.len() as i32 - 2 * f_width;
 
-    let prog  = format!("{:4.2}{} / {:4.2}{} - {:width$} / {:width$}", size as f64 / factor, s, total_size as f64 / factor, s, files, total_files, width = f_width as usize);
+    let prog  = format!("{:>5.2}{} / {:>5.2}{} - {:width$} / {:width$}", size as f64 / factor, s, total_size as f64 / factor, s, files, total_files, width = f_width as usize);
 
     let bar = get_progress_bar(width as usize, size as f64, total_size as f64);
-    let output = format!("{} {}", bar, prog );
+    let output = format!("{} {}", prog, bar );
     win.printw(output);
 
+    let l = file_names.iter().map(|n| n.len()).max().unwrap();
     for i in 0..file_names.len() {
         win.mv(win.get_cur_y()+1 , win.get_beg_x());
         
@@ -179,11 +190,11 @@ async fn draw(win: &Window, start_y: i32, total_files: usize, files: usize, tota
         let file_size = file_max_size[i];
         let (factor, s) = get_size_factor(file_max_size[i]);
 
-        let width = win.get_max_x() - 30 - 2*s.len() as i32 - name.len() as i32;
-        let prog  = format!("{:4.2}{} / {:4.2}{} {}", file_progress as f64 / factor, s, file_size as f64 / factor, s, name);
+        let width = win.get_max_x() - 30 - 2*s.len() as i32 - l as i32;
+        let prog  = format!("{:>6.2}{} / {:>6.2}{} {:width$}", file_progress as f64 / factor, s, file_size as f64 / factor, s, name, width = l);
         let bar = get_progress_bar(width as usize, file_progress as f64, file_size as f64);
         
-        let output = format!("{} {}", bar, prog );
+        let output = format!("{} {}", prog, bar );
         win.printw(output);
     }
     
@@ -216,5 +227,6 @@ fn get_progress_bar(width: usize, current: f64, total: f64) -> String {
         let x = (progress * (w - 1) as f64).floor() as usize;
         ["=".repeat(x), ">".to_owned(), " ".repeat(w.saturating_sub(x))].join("")
     };
-    format!("[{}] {:2.2}%%",str, progress * 100.0 )
+    let s = format!("{:.2}", progress*100.0);
+    format!("{:>7}%% [{}]",s, str )
 }
