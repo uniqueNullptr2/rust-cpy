@@ -1,0 +1,16 @@
+# rust-cpy
+- a simple copy utility in rust.
+- indexes target and destionation to only copy files that are missing or of different size
+- pretty
+
+![](example.png)
+
+## danger
+- couple unwraps and not too much error checking.
+- might be prone to crashes. 
+- freezes occasionally when copying files over the network
+- better not specify too many "threads"
+
+## why
+- normal copy doesnt take into account files that were already copied in a previous attempt
+- rsync is not as pretty
