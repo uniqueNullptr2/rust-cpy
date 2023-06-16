@@ -1,13 +1,13 @@
 use std::{path::{Path, PathBuf}, time::{SystemTime, Duration}, collections::{BTreeMap}, fs::{Permissions, create_dir_all}, env, sync::Arc};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender, unbounded};
+use futures_util::future::join_all;
 use pathdiff::diff_paths;
 use tokio::{io::{BufReader, BufWriter}, fs::File, time::Instant};
 use walkdir::WalkDir;
 use tokio_util::compat::*;
 use clap::{Parser, Subcommand};
 use pancurses::{Window, endwin, initscr, Input, noecho};
-
 
 #[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -38,9 +38,9 @@ enum ProgressMassage {
 }
 
 
-fn index_path<T: AsRef<Path>>(root: T) -> Result<BTreeMap<PathBuf, (usize, Permissions, SystemTime, SystemTime)>> {
+fn index_path<T: AsRef<Path>>(root: T) -> Result<BTreeMap<PathBuf, (usize, Permissions, Option<SystemTime>, Option<SystemTime>)>> {
     let rootp = root.as_ref().to_owned();
-    let mut map = BTreeMap::<PathBuf, (usize, Permissions, SystemTime, SystemTime)>::new();
+    let mut map = BTreeMap::<PathBuf, (usize, Permissions, Option<SystemTime>, Option<SystemTime>)>::new();
     if !rootp.exists() {
         return Ok(map);
     }
@@ -50,7 +50,7 @@ fn index_path<T: AsRef<Path>>(root: T) -> Result<BTreeMap<PathBuf, (usize, Permi
             // TODO own pathdiff without cloning
             let diff = diff_paths(e.path().to_owned(), rootp.clone()).unwrap();
             let meta = e.metadata()?;
-            map.insert(diff, (meta.len() as usize, meta.permissions(), meta.created()?, meta.modified()?));
+            map.insert(diff, (meta.len() as usize, meta.permissions(), meta.created().ok(), meta.modified().ok()));
         }
     }
     Ok(map)
@@ -66,7 +66,7 @@ async fn copy_file(id: usize, size: usize, rel: PathBuf, src: PathBuf, dst: Path
     let reader = BufReader::new(srcf);
     let writer = BufWriter::new(dstf);
     let report_progress = |amt| {
-        send.send_blocking(ProgressMassage::Progress { id, size: amt }).unwrap();
+        send.send_blocking(ProgressMassage::Progress { id, size: amt }).ok();
     };
     async_copy_progress::copy(&mut reader.compat(), &mut writer.compat_write(), report_progress).await?;
     send.send(ProgressMassage::Finished{id}).await?;
@@ -84,28 +84,45 @@ async fn main() -> Result<()> {
     let mut files = 0;
     let mut t_size = 0;
 
-    for (_, (si, _, _, _)) in src_map.iter().filter(|(k, _)| !dst_map.contains_key(*k)) {
+    for (_, (si, _, _, _)) in src_map.iter().filter(|(k, (si, _, _, _))|  {
+        if let Some((dsize, _, _, _)) = dst_map.get(*k) {
+            if dsize != si {
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    }) {
         files += 1;
         t_size += si;
     }
 
     let (tx, rx) = unbounded();
     let (utx, urx) = unbounded();
+
+    let mut handles = vec!();
+
     for i in 0..cli.threads {
         // let t_dst_map = dst_map.clone();
         let t_cli = cli.clone();
-        let trx = rx.clone();
+        let trx: Receiver<(PathBuf, usize, Permissions, Option<SystemTime>, Option<SystemTime>)> = rx.clone();
         let tutx = utx.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             loop {
-                let (path, size, permission, created, modified): (PathBuf, usize, Permissions, SystemTime, SystemTime) = trx.recv().await.unwrap();
-                copy_file(i, size, path.to_owned(), t_cli.src.join(&path), t_cli.dst.join(&path), tutx.clone()).await.unwrap();
+                if trx.is_closed() && trx.is_empty() {
+                    break;
+                }
+                if let Some((path, size, permission, created, modified)) = trx.recv().await.ok() {
+                    copy_file(i, size, path.to_owned(), t_cli.src.join(&path), t_cli.dst.join(&path), tutx.clone()).await.ok();
+                }
             }
             
-        });
+        }));
     }
     
-    tokio::spawn(async move {
+    handles.push(tokio::spawn(async move {
         for (path, (size, perm, created, modified)) in src_map.into_iter() {
             if let Some((dsize, _, _, _)) = dst_map.get(&path) {
                 if *dsize != size {
@@ -115,7 +132,7 @@ async fn main() -> Result<()> {
                 tx.send((path, size, perm, created, modified)).await.unwrap();
             }
         }
-    });
+    }));
 
     let window = initscr();
     window.nodelay(true);
@@ -147,7 +164,8 @@ async fn main() -> Result<()> {
                     v[id] = size;
                 },
                 ProgressMassage::Finished { id } =>  {
-                    // v[id] = vvv[id] as u64;
+                    c_size = c_size - v[id] as usize + vvv[id];
+                    v[id] = vvv[id] as u64;
                     count += 1;
                 },
             }
@@ -161,7 +179,9 @@ async fn main() -> Result<()> {
             break;
         }
     }
+
     endwin();
+    join_all(handles).await;
     Ok(())
 }
 
@@ -175,7 +195,7 @@ async fn draw(win: &Window, start_y: i32, total_files: usize, files: usize, tota
     let f_width = (total_files as f64).log10().floor() as i32 + 1;
     let width = win.get_max_x() - 28 - 2*s.len() as i32 - 2 * f_width;
 
-    let prog  = format!("{:>5.2}{} / {:>5.2}{} - {:width$} / {:width$}", size as f64 / factor, s, total_size as f64 / factor, s, files, total_files, width = f_width as usize);
+    let prog  = format!("{:>6.2}{} / {:>5.2}{} - {:width$} / {:width$}", size as f64 / factor, s, total_size as f64 / factor, s, files, total_files, width = f_width as usize);
 
     let bar = get_progress_bar(width as usize, size as f64, total_size as f64);
     let output = format!("{} {}", prog, bar );
@@ -199,8 +219,6 @@ async fn draw(win: &Window, start_y: i32, total_files: usize, files: usize, tota
     }
     
     win.refresh();
-
-    
     Ok(())
 }
 
@@ -221,11 +239,11 @@ fn get_size_factor(size: usize) -> (f64, String) {
 fn get_progress_bar(width: usize, current: f64, total: f64) -> String {
     let progress = current / total;
     let w = width - 8;
-    let str = if progress == 100.0 {
+    let str = if progress > 0.99{
         "=".repeat(w)
     } else {
         let x = (progress * (w - 1) as f64).floor() as usize;
-        ["=".repeat(x), ">".to_owned(), " ".repeat(w.saturating_sub(x))].join("")
+        ["=".repeat(x), ">".to_owned(), " ".repeat((w-1).saturating_sub(x))].join("")
     };
     let s = format!("{:.2}", progress*100.0);
     format!("{:>7}%% [{}]",s, str )
