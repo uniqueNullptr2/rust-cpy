@@ -6,7 +6,7 @@ use tokio::{io::{BufReader, BufWriter}, fs::File};
 use walkdir::WalkDir;
 use tokio_util::compat::*;
 use clap::{Parser, Subcommand};
-use pancurses::{Window, endwin, initscr, Input};
+use pancurses::{Window, endwin, initscr, Input, noecho};
 
 
 #[derive(Parser, Clone)]
@@ -80,25 +80,26 @@ async fn main() -> Result<()> {
     println!("Indexing");
 
     let src_map = index_path(&cli.src)?;
-    let dst_map = Arc::new(index_path(&cli.dst)?);
+    let dst_map = index_path(&cli.dst)?;
+    let mut files = 0;
+    let mut t_size = 0;
+
+    for (_, (si, _, _, _)) in src_map.iter().filter(|(k, _)| !dst_map.contains_key(*k)) {
+        files += 1;
+        t_size += si;
+    }
 
     let (tx, rx) = unbounded();
     let (utx, urx) = unbounded();
     for i in 0..cli.threads {
-        let t_dst_map = dst_map.clone();
+        // let t_dst_map = dst_map.clone();
         let t_cli = cli.clone();
         let trx = rx.clone();
         let tutx = utx.clone();
         tokio::spawn(async move {
             loop {
                 let (path, size, permission, created, modified): (PathBuf, usize, Permissions, SystemTime, SystemTime) = trx.recv().await.unwrap();
-                if let Some((dsize, _, _, _)) = t_dst_map.get(&path) {
-                    if *dsize != size {
-                        copy_file(i, size, path.to_owned(), t_cli.src.join(&path), t_cli.dst.join(&path), tutx.clone()).await.unwrap();
-                    }
-                } else {
-                    copy_file(i, size, path.to_owned(), t_cli.src.join(&path), t_cli.dst.join(&path), tutx.clone()).await.unwrap();
-                }
+                copy_file(i, size, path.to_owned(), t_cli.src.join(&path), t_cli.dst.join(&path), tutx.clone()).await.unwrap();
             }
             
         });
@@ -106,70 +107,114 @@ async fn main() -> Result<()> {
     
     tokio::spawn(async move {
         for (path, (size, perm, created, modified)) in src_map.into_iter() {
-            tx.send((path, size, perm, created, modified)).await.unwrap();
+            if let Some((dsize, _, _, _)) = dst_map.get(&path) {
+                if *dsize != size {
+                    tx.send((path, size, perm, created, modified)).await.unwrap();
+                }
+            } else {
+                tx.send((path, size, perm, created, modified)).await.unwrap();
+            }
         }
     });
 
-    tokio::spawn(async move {
-        let mut v = vec![0u64; cli.threads as usize];
-        let mut vv = vec!["".to_owned(); cli.threads as usize];
-        let mut vvv = vec![0usize; cli.threads as usize];
+    let window = initscr();
+    window.nodelay(true);
+    window.keypad(true);
+    noecho();
+    let start_y = window.get_cur_y();
 
-        loop {
-            let msg = urx.recv().await.unwrap();
-            match msg {
-                ProgressMassage::Start { id , path, size} => {
-                    v[id] = 0;
-                    vv[id] = path.to_string_lossy().into();
-                    vvv[id] = size
-                },
-                ProgressMassage::Progress { id, size } => v[id] += size,
-                ProgressMassage::Finished { id } =>  {
-                    v[id] = vvv[id] as u64;
-                },
-            }
-            let s: Vec<String>= (0..cli.threads as usize).map(|i| format!("{}: {}/{}",  vv[i], v[i], vvv[i])).collect();
-            print!("\r{}\r", s.join(" "));
+    let mut v = vec![0u64; cli.threads as usize];
+    let mut vv = vec!["".to_owned(); cli.threads as usize];
+    let mut vvv = vec![0usize; cli.threads as usize];
+
+    let mut count = 0;
+    let mut c_size: usize = 0;
+    loop {
+        if count == files {
+            break;
         }
-    }).await?;
+        let msg = urx.recv().await.unwrap();
+        match msg {
+            ProgressMassage::Start { id , path, size} => {
+                v[id] = 0;
+                vv[id] = path.file_name().unwrap().to_str().unwrap().to_owned();
+                vvv[id] = size;
+            },
+            ProgressMassage::Progress { id, size } => {
+                c_size = c_size - v[id] as usize + size as usize;
+                v[id] = size;
+            },
+            ProgressMassage::Finished { id } =>  {
+                // v[id] = vvv[id] as u64;
+                count += 1;
+            },
+        }
+        draw(&window, start_y, files, count, t_size, c_size, &vv, &v, &vvv).await.unwrap();
+    }
+    endwin();
     Ok(())
 }
 
 
-// fn draw() {
-//     let files = vec!("File1.pdf", "File2.bmp", "File3.xml", "File4.mov", "File5.db");
-//     let window = initscr();
-//     window.nodelay(true);
-//     window.keypad(true);
-//     noecho();
-//     window.printw("Downloading Files (not Actually)\n");
-//     let mut ys = window.get_cur_y();
+async fn draw(win: &Window, start_y: i32, total_files: usize, files: usize, total_size: usize, size: usize, file_names: &Vec<String>, file_current_size: &Vec<u64>, file_max_size: &Vec<usize>) -> Result<()> {
 
-//     let mut progressbar = ProgressBar::new(files.into_iter().map(|s| s.to_owned()).collect(), ys, 50);
-//     progressbar.start();
+    let (factor, s) = get_size_factor(total_size);
 
-//     ys += progressbar.len() as i32;
+    win.erase();
+    win.mv(start_y as i32, win.get_beg_x());
+    let f_width = (total_files as f64).log10().floor() as i32 + 1;
+    let width = win.get_max_x() - 28 - 2*s.len() as i32 - 2 * f_width;
 
-//     let mut items: Vec<Box<RefCell<dyn WindowItem>>> = vec!(Box::new(RefCell::new(progressbar)));
-//     items.push(Box::new(RefCell::new(ScrollingMsg::new("Hello there!".to_owned(), 36, ys, 4))));
+    let prog  = format!("{:4.2}{} / {:4.2}{} - {:width$} / {:width$}", size as f64 / factor, s, total_size as f64 / factor, s, files, total_files, width = f_width as usize);
 
-//     ys += 1;
-//     progressbar = ProgressBar::new(vec!("Folder.xfp", "My Photos", "Friends Season 1").into_iter().map(|s| s.to_owned()).collect(), ys, 40);
-//     progressbar.start();
-//     ys += progressbar.len() as i32;
-//     items.push(Box::new(RefCell::new(progressbar)));
+    let bar = get_progress_bar(width as usize, size as f64, total_size as f64);
+    let output = format!("{} {}", bar, prog );
+    win.printw(output);
 
-//     items.push(Box::new(RefCell::new(ScrollingMsg::new("YAAAAAAAAAAAAS!".to_owned(), 36, ys, 4))));
-//     loop {
-//         match window.getch() {
-//             Some(Input::KeyDC) => {
-//                 break;
-//             },
-//             _ => (),
-//         }
-//         for item in &items {
-//             item.borrow_mut().poll(&window);
-//         }
-//     }
-//     endwin();
-// }
+    for i in 0..file_names.len() {
+        win.mv(win.get_cur_y()+1 , win.get_beg_x());
+        
+        let name = &file_names[i];
+        let file_progress = file_current_size[i];
+        let file_size = file_max_size[i];
+        let (factor, s) = get_size_factor(file_max_size[i]);
+
+        let width = win.get_max_x() - 30 - 2*s.len() as i32 - name.len() as i32;
+        let prog  = format!("{:4.2}{} / {:4.2}{} {}", file_progress as f64 / factor, s, file_size as f64 / factor, s, name);
+        let bar = get_progress_bar(width as usize, file_progress as f64, file_size as f64);
+        
+        let output = format!("{} {}", bar, prog );
+        win.printw(output);
+    }
+    
+    win.refresh();
+
+    
+    Ok(())
+}
+
+fn get_size_factor(size: usize) -> (f64, String) {
+    if size < 1024 {
+        (1.0, "b".to_owned())
+    } else if size < 1024 * 1024 {
+        (1024.0, "Kb".to_owned())
+    } else if size < 1024 * 1024 * 1024 {
+        ((1024.0*1024.0), "Mb".to_owned())
+    } else if size < 1024 * 1024 * 1024 * 1024 {
+        ((1024.0*1024.0*1024.0), "Gb".to_owned())
+    } else {
+        ((1024.0*1024.0*1024.0*1024.0), "Tb".to_owned())
+    }
+}
+
+fn get_progress_bar(width: usize, current: f64, total: f64) -> String {
+    let progress = current / total;
+    let w = width - 8;
+    let str = if progress == 100.0 {
+        "=".repeat(w)
+    } else {
+        let x = (progress * (w - 1) as f64).floor() as usize;
+        ["=".repeat(x), ">".to_owned(), " ".repeat(w.saturating_sub(x))].join("")
+    };
+    format!("[{}] {:2.2}%%",str, progress * 100.0 )
+}
